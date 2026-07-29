@@ -67,20 +67,38 @@ def dashboard():
 <html>
 <head>
     <title>C2 Dashboard</title>
-    <meta http-equiv="refresh" content="10">
     <style>
         body {{ font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; }}
+        .refresh-btn {{
+            background: #111;
+            color: #0f0;
+            border: 1px solid #0f0;
+            padding: 8px 16px;
+            font-family: monospace;
+            font-size: 1rem;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background 0.2s, color 0.2s;
+        }}
+        .refresh-btn:hover {{
+            background: #0f0;
+            color: #0a0a0a;
+        }}
         .event {{ border: 1px solid #333; padding: 10px; margin: 8px 0; border-radius: 5px; }}
         .sms {{ border-left: 4px solid cyan; }}
         .call {{ border-left: 4px solid yellow; }}
         .location {{ border-left: 4px solid lime; }}
         .timestamp {{ color: #888; font-size: 0.8em; margin-bottom: 4px; }}
         pre {{ margin: 0; white-space: pre-wrap; word-break: break-all; }}
-        h1 {{ color: #0f0; }}
+        h1 {{ color: #0f0; margin: 0; }}
     </style>
 </head>
 <body>
-    <h1>C2 Dashboard</h1>
+    <div class="header">
+        <h1>C2 Dashboard</h1>
+        <button onclick="location.reload()" class="refresh-btn">🔄 Refresh</button>
+    </div>
     <p>Total events: {len(log_entries)}</p>
     <hr>
     {events_html or '<p>No events yet.</p>'}
