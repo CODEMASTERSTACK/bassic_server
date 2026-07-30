@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, Response
 from datetime import datetime
 import json
 import os
@@ -296,7 +296,7 @@ def get_stats():
 
 @app.route('/')
 def control_panel():
-    return render_template_string(CONTROL_PANEL_HTML)
+    return Response(CONTROL_PANEL_HTML, mimetype='text/html')
 
 CONTROL_PANEL_HTML = '''
 <!DOCTYPE html>
@@ -465,14 +465,19 @@ CONTROL_PANEL_HTML = '''
         }
         
         async function loadDevices() {
+            const container = document.getElementById('deviceList');
             try {
                 const res = await fetch('/api/devices');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
                 const data = await res.json();
                 devices = data.devices || [];
                 renderDevices();
-                document.getElementById('deviceCount').textContent = data.total || devices.length;
-                document.getElementById('onlineCount').textContent = data.online || devices.filter(d => d.online).length;
-            } catch(e) { console.error('Devices error:', e); }
+                document.getElementById('deviceCount').textContent = data.total != null ? data.total : devices.length;
+                document.getElementById('onlineCount').textContent = data.online != null ? data.online : devices.filter(d => d.online).length;
+            } catch(e) {
+                console.error('Devices error:', e);
+                container.innerHTML = '<p style="color:#f44;">Error loading devices: ' + e.message + '</p><p style="color:#666;">Check console for details.</p>';
+            }
         }
         
         function renderDevices() {
